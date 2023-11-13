@@ -56,18 +56,14 @@ class KernelWSILoader(torch.utils.data.Dataset):
         pos = np.concatenate(pos, axis=0)
         pos_radius = np.concatenate(pos_radius, axis=0)
         pos = np.hstack((pos,pos_radius.reshape(-1,1)))
- 
-        if len(pos)>self.nk:
-            rd_index = np.random.permutation(len(pos))[0:self.nk]
-            pos = pos[rd_index]
     
         all_pos = wsi_data['pos'][:num_node]
 
         wsi_label = int(self.dl[idx][1])
-
         text_index = wsi_data['text']
         promote = wsi_data['prompt']
-        data = self.pack_data(features, rd, num_node, text_index, promote, pos, all_pos, wsi_label)               
+        data = self.pack_data(features, rd, num_node, text_index, promote, pos, all_pos, wsi_label)    
+
         return data, wsi_label, self.get_wsi_data_path(idx).split('/')[-1][:-4]
 
 
@@ -115,6 +111,7 @@ class KernelWSILoader(torch.utils.data.Dataset):
         labels -= np.min(labels)
         tmp = np.bincount(labels)
         weights = 1 / np.asarray(tmp[labels], np.float)
+        
         return weights
 
 class DistributedWeightedSampler(data.DistributedSampler):

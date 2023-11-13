@@ -5,7 +5,6 @@ import copy
 from typing import Optional, List
 import torch.nn.functional as F
 import math
-import numpy as np
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -248,14 +247,22 @@ class KATBlocks(nn.Module):
 
 
 class FGCR(nn.Module):
-    def __init__(self, patch_dim, prompt_num, dim, depth, heads, mlp_dim, vocab_size=300, m_head=8, m_d_ff=512, m_dropout=0.5, m_n_layer=6, t_head=4, t_n_layer=6, t_d_model=256, t_d_ff=512, 
-                 t_dropout=0.5, num_kernel=25, pool = 'cls', dim_head = 64, dropout = 0.5, emb_dropout = 0.,emd_dim= 128, max_position_embeddings=175):
+    def __init__(self, patch_dim, prompt_num, dim, depth, heads, mlp_dim, prompt_list, vocab_size=300, t_head=4, t_n_layer=6, t_d_model=256, t_d_ff=512, 
+                 t_dropout=0.5, num_kernel=25, dim_head = 64, dropout = 0.5, emb_dropout = 0.,emd_dim= 128, max_position_embeddings=175):
         super().__init__()
 
-        assert pool in {'cls', 'mean'}, 'pool type must be either cls (cls token) or mean (mean pooling)'
+        #Image_encoder
+        self.to_patch_embedding = nn.Linear(patch_dim, dim)
+        self.img_cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.kernel_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.nk = num_kernel
+        self.kt = KATBlocks(dim, depth, heads, dim_head, mlp_dim, dropout)
+
+
+        #Text Encoder
+        self.prompt = prompt_list
         self.register_buffer("position_ids", torch.arange(max_position_embeddings).expand((1, -1)))
         self.text_position_embeddings = nn.Embedding(max_position_embeddings, dim)
-        self.to_patch_embedding = nn.Linear(patch_dim, dim)
         self.text_embedding = nn.Embedding(vocab_size, emd_dim)
         self.text_linear = nn.Linear(emd_dim, dim)
         text_encoder_layer = TransformerEncoderLayer(t_d_model, t_head, t_d_ff,
@@ -264,32 +271,17 @@ class FGCR(nn.Module):
         self.text_encoder = TransformerEncoder(text_encoder_layer, t_n_layer, text_encoder_norm)
         self.LayerNorm = nn.LayerNorm(t_d_model) 
         self.text_cls_token = nn.Parameter(torch.randn(1, 1, dim))
+        self.text_head = BertLMPredictionHead(dim, vocab_size)
 
-
-        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.kernel_token = nn.Parameter(torch.randn(1, 1, dim))
-        self.nk = num_kernel
-
-        self.dropout = nn.Dropout(emb_dropout)
-
-        self.kt = KATBlocks(dim, depth, heads, dim_head, mlp_dim, dropout)
-        self.pool = pool
-
+        #Local sructure
+        self.local_atten_layer = nn.MultiheadAttention(
+            dim, heads)
         self.mlp_head = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, prompt_num) 
         )
-        self.token_type_embeddings = nn.Embedding(2, dim)
-
-
-        self.text_head = BertLMPredictionHead(dim, vocab_size)
-        self.cross_entropy = nn.CrossEntropyLoss()
-        self.cos_sim = nn.CosineSimilarity(dim=0, eps=1e-6)
-
-
-        self.local_atten_layer = nn.MultiheadAttention(
-            dim, heads)
-
+        
+        self.dropout = nn.Dropout(emb_dropout)
         self.activate = nn.Tanh()
 
 
@@ -298,19 +290,20 @@ class FGCR(nn.Module):
         # extract image features
         x = self.to_patch_embedding(node_features)
         b = x.shape[0]
-        cls_tokens = repeat(self.cls_token, '() n d -> b n d', b = b)
+        cls_tokens = repeat(self.img_cls_token, '() n d -> b n d', b = b)
         kernel_tokens = repeat(self.kernel_token, '() () d -> b k d', b = b, k = self.nk)
         x = self.dropout(x)
-        k_reps, clst, atten_map = self.kt(x, kernel_tokens, krd, cls_tokens, mask, kmask)
+        k_reps, clst, _ = self.kt(x, kernel_tokens, krd, cls_tokens, mask, kmask)
         kat_img_ebd = k_reps[5]
         img_token = clst[:,0]
+        img_token = self.activate(img_token)
 
         # extract text features
         t = self.text_embedding(text)
         t = self.text_linear(t)
         position_ids = self.position_ids[:, 0 : t.size()[1]]
         position_embeddings = self.text_position_embeddings(position_ids)
-        t = t[:,:,0,:]
+        t = t.squeeze(dim=2)
         t += position_embeddings
         text_cls_tokens = repeat(self.text_cls_token, '() n d -> b n d', b = b)
         t = torch.cat((text_cls_tokens, t), dim=1)
@@ -322,6 +315,7 @@ class FGCR(nn.Module):
         t_out = self.text_encoder(t, src_key_padding_mask=t_inmask)
         text_token = t_out[:,0]
         text_emd = t_out[:,1:]
+        text_token = self.activate(text_token)
 
         t_rnd_mask = torch.rand(tmask.size(), out=None).type_as(node_features)<0.6
         t_inmask_hide = torch.cat((tmp, t_rnd_mask*tmask), dim=1)[:,:,0]
@@ -330,102 +324,31 @@ class FGCR(nn.Module):
         text_emd_hide = t_hide[:,1:]
         
         #extract prompt features
-        prompt_index = np.load("configs/prompt_index.npy")
-        prompt_index = torch.tensor(prompt_index).int().cuda(non_blocking=True).long()
+        prompt_index = torch.tensor(self.prompt).int().cuda(non_blocking=True).long()
         prompt_index = prompt_index.repeat(b,1,1).permute(0, 2, 1)
         p = self.text_embedding(prompt_index)
         p = self.text_linear(p)
         position_ids = self.position_ids[:, 0 : prompt_index.size()[1]]
         position_embeddings = self.text_position_embeddings(position_ids)
-        p = p[:,:,0,:]
+        p = p.squeeze(dim=2)
         p += position_embeddings        
         p = self.LayerNorm(p)
         p = self.dropout(p) 
         p = self.text_encoder(p)
        
-        #calculate loss functions 
         mlm_logits = self.text_head(text_emd_hide)
         mlm_logits = torch.sigmoid(mlm_logits)
-        mlm_loss = self.cross_entropy(mlm_logits.view(-1, mlm_logits.size(-1))[tmask.view(-1)>0], text.view(-1)[tmask.view(-1)>0])*0.1
-
-        img_token = self.activate(img_token)
-        text_token = self.activate(text_token)
         t_cls = self.mlp_head(text_token)
         cls_out = self.mlp_head(img_token)      
-        pc_loss =  multi_cls_loss(cls_out, prompt, pmask) + 0.5*multi_cls_loss(t_cls, prompt, pmask)
-
-        WRA_loss = WRA_Loss(img_token, text_token)*0.15
-
-        APA_loss, soft_pred, soft_pred_k = APA_Loss(kat_img_ebd, kmask, p, prompt, pmask)
 
         patch_atten_output, _ = self.local_atten_layer(
             kat_img_ebd.permute(1, 0, 2), text_emd.permute(1, 0, 2), text_emd.permute(1, 0, 2), key_padding_mask=t_inmask[:,1:])
         text_atten_output, _ = self.local_atten_layer(
             text_emd.permute(1, 0, 2), kat_img_ebd.permute(1, 0, 2), kat_img_ebd.permute(1, 0, 2), key_padding_mask=kmask[:,:,0]<0.5)
-        loss_patch = cross_sim_loss(kat_img_ebd, patch_atten_output, kmask)/6
-        loss_text = cross_sim_loss(text_emd, text_atten_output, tmask)/6
-        loss_cross_sim = loss_text+loss_patch
+        
+        return mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token, text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output
 
-        loss = APA_loss+WRA_loss+mlm_loss+loss_cross_sim+pc_loss
-        return k_reps, loss, soft_pred, img_token, text_token
-
-
-def multi_cls_loss(im_out, prompt, pmask):
-    target = torch.zeros(im_out.size()).cuda()
-    ce_loss = torch.zeros(im_out.size()[0]).cuda()
-    for i in range(im_out.size()[0]):
-        target[i,prompt[i][pmask[i]>0]]=1 
-        ce_loss[i] = F.binary_cross_entropy(torch.softmax(im_out[i].clone(),dim=0), target[i].clone())
-    return ce_loss.mean()
-
-def APA_Loss(img_feat, kmask, p_ebd, prompt, pmask, T=10):
-    img_text_matrix =  einsum('b i j, b j d -> b i d', img_feat, p_ebd.permute(0, 2, 1))/img_feat.size()[2]/T
-    target = torch.zeros(p_ebd.size()[0:2]).cuda()
-    ce_loss = torch.zeros(p_ebd.size()[0]).cuda()
-    soft_pred = torch.zeros(p_ebd.size()[0:2]).cuda()
-    soft_pred_k = torch.zeros(img_text_matrix.size()).cuda()
-    for i in range(img_text_matrix.size()[0]):
-        target[i,prompt[i][pmask[i]>0]]=1 
-        kmask_part = kmask[i].reshape(img_text_matrix.size()[1])>0
-        img_text_matrix_part = img_text_matrix[i][kmask_part]
-        pred_logit_part = torch.sigmoid(img_text_matrix_part)
-        soft_pred_part = torch.softmax(img_text_matrix_part,dim=0) *pred_logit_part
-        soft_pred_k[i][kmask_part] = soft_pred_part
-        soft_pred[i] = soft_pred_part.sum(0)
-        ce_loss[i] = F.binary_cross_entropy(soft_pred[i].clone(), target[i].clone())
-    return ce_loss.mean(), soft_pred, soft_pred_k
-
-def WRA_Loss(img_rep, text_rep):
-    bz = img_rep.size(0)
-    labels = torch.arange(bz).type_as(text_rep).long()
-
-    scores = img_rep.mm(text_rep.t())/img_rep.size(1)
-    scores1 = scores.transpose(0, 1)
-    loss0 = F.cross_entropy(scores, labels)
-    loss1 = F.cross_entropy(scores1, labels)
-    loss_ita = loss0 + loss1
-    return loss_ita
-
-def cross_sim_loss(kat_img_ebd, data_atten_output, mask):
-    data_sim = torch.bmm(kat_img_ebd, data_atten_output.permute(
-        1, 2, 0)) / kat_img_ebd.size(2)
-    data_num = data_sim.size(1)
-    bz = data_sim.size(0)
-    mask = rearrange(mask, "b n1 n2 -> (b n1 n2)")>0
-    data_sim_1 = rearrange(data_sim, "b n1 n2 -> (b n1) n2")
-    targets = torch.arange(data_num).type_as(
-        data_sim).long().repeat(bz)
-    loss_data_1 = torch.sum(F.cross_entropy(
-        data_sim_1[mask], targets[mask], reduction="none") ) / mask.sum()
-
-    data_sim_2 = rearrange(data_sim, "b n1 n2 -> (b n2) n1")
-    loss_data_2 = torch.sum(F.cross_entropy(
-        data_sim_2[mask], targets[mask], reduction="none") ) / mask.sum()
-
-    loss = (loss_data_1 + loss_data_2) / 2.
-    return 0.1*loss
-
-def fgcr_inference(kat_model, data):
+def fgcr_inference(model, data):
     feats = data[0].float().cuda(non_blocking=True)
     rd = data[1].float().cuda(non_blocking=True)
     text = data[2].int().cuda(non_blocking=True).long()
@@ -435,7 +358,8 @@ def fgcr_inference(kat_model, data):
     tmask = data[6].int().cuda(non_blocking=True)
     pmask = data[7].int().cuda(non_blocking=True)
     wsi_label = data[10].int().cuda(non_blocking=True).long()
-    return kat_model(feats, rd, text, prompt, masks, kmasks, tmask, pmask, wsi_label)
+
+    return model(feats, rd, text, prompt, masks, kmasks, tmask, pmask, wsi_label)
 
 
 
