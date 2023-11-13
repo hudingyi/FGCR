@@ -281,9 +281,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-
-    criterion = nn.CrossEntropyLoss().cuda(args.gpu)
-    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.7)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=int(0.3*args.num_epochs), eta_min=5e-8)
     if checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer'])
@@ -296,7 +293,7 @@ def main_worker(gpu, ngpus_per_node, args):
     best_loss = 100
     for epoch in range(args.start_epoch, args.num_epochs):
         begin_time = time.time()
-        _, train_pacc = train(train_loader, model, criterion, optimizer, epoch, args)
+        _, train_pacc = train(train_loader, model, optimizer, epoch, args)
 
         
 
@@ -306,10 +303,10 @@ def main_worker(gpu, ngpus_per_node, args):
                                                     and args.rank == 0):
             if epoch % args.eval_freq == 0:
                 if valid_loader is not None:
-                    val_loss, val_pacc = evaluate(valid_loader, model, criterion, args, 'Valid')
+                    val_loss, val_pacc = evaluate(valid_loader, model, args, 'Valid')
 
                 if test_loader is not None:
-                    test_loss, test_pacc = evaluate(test_loader, model, criterion, args, 'Test')
+                    test_loss, test_pacc = evaluate(test_loader, model, args, 'Test')
 
                 with open(graph_model_path + '/log_acc.csv', 'a') as f:
                     f.write('{},{:.3f},V,{:.3f},{:.3f},T,{:.3f},{:.3f}, SUB,'.format(
@@ -334,7 +331,7 @@ def main_worker(gpu, ngpus_per_node, args):
                     }, os.path.join(graph_model_path, 'model_{}.pth.tar'.format(epoch + 1)))
 
 
-def train(train_loader, model, criterion, optimizer, epoch, args):
+def train(train_loader, model, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -396,11 +393,9 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
 
 
-def evaluate(val_loader, model, criterion, args, prefix='Test'):
+def evaluate(val_loader, model, args, prefix='Valid'):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top2 = AverageMeter('Acc@2', ':6.2f')
     progress = ProgressMeter(len(val_loader), batch_time, losses,
                              prefix=prefix)
 
@@ -454,11 +449,70 @@ def evaluate(val_loader, model, criterion, args, prefix='Test'):
         acc = 0
         p_acc.append(acc)
     print(prefix+" prompt_ACC:"+str(np.mean(p_acc)))
-
-
     return losses.avg, np.mean(p_acc)
 
+def save_feature(val_loader, model, args, graph_model_path, prefix='Valid'):
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    progress = ProgressMeter(len(val_loader), batch_time, losses,
+                             prefix=prefix)
 
+    # switch to evaluate mode
+    model.eval()
+    y_labels = []
+    prompt_pred = []
+    prompt = []
+    pmask = []
+    slide_total = []
+    img_feature = []
+    text_feature = []
+    end = time.time()
+    
+    processing_time = 0
+    with torch.no_grad():
+        for i, (data, label, slide) in enumerate(val_loader):
+            target = label.cuda(non_blocking=True)
+            # compute output
+            pro_start = time.time()
+            _, loss, soft_pred, img_token, text_token = fgcr_inference(model, data)
+            processing_time += (time.time() - pro_start)
+
+            prompt_pred.append(soft_pred.cpu().data)
+            y_labels.append(label)
+            prompt.append(data[3][:,:,0])
+            pmask.append(data[7][:,:,0])
+            slide_total.append(slide)
+            img_feature.append(img_token.cpu().data)
+            text_feature.append(text_token.cpu().data)
+            # measure accuracy and record loss
+            losses.update(loss.item(), target.size(0))
+
+            # measure elapsed time
+            batch_time.update(time.time() - end)
+            end = time.time()
+
+            if i % args.print_freq == 0:
+                progress.print(i)
+    y_labels = torch.cat(y_labels)
+    obj = chain.from_iterable(slide_total)
+    slide_total = list(obj)
+    img_feature = torch.cat(img_feature)
+    text_feature = torch.cat(text_feature)
+    prompt_pred = torch.cat(prompt_pred)
+    prompt = torch.cat(prompt)
+    pmask = torch.cat(pmask)
+    graph_save_path = os.path.jion(graph_model_path, prefix+'_token_feature.pkl')
+    with open(graph_save_path, 'wb') as f:
+        graph = {
+            'prompt_pred':prompt_pred.numpy(),
+            'prompt':prompt.numpy(),
+            'pmask': pmask.numpy(),
+            'img_feature':img_feature.numpy(),
+            'text_feature':text_feature.numpy(),
+            'labels':y_labels.numpy(),
+            'slide_total':slide_total,
+            }
+        pickle.dump(graph, f)
 
 if __name__ == "__main__":
     args = arg_parse()
