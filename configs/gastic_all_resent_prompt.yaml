@@ -1,0 +1,50 @@
+DATA:
+  DATASET_CONFIG_DIR: './dataset/gastric-all'
+  DATA_SAVE_DIR: './data/gastric-all'
+  LABEL_ID: 5 # 1 for subtype task, 2 for binary task
+  TEST_RATIO: 0.3
+  FOLD_NUM: 5
+IMAGE:
+  LEVEL: 1 # 20X lens
+  MASK_LEVEL: 3 
+  PATCH_SIZE: 224
+  LOCAL_TILE_SIZE: 512
+SAMPLE:
+  POS_RAT: 0.5
+  NEG_RAT: 0.05
+  INTENSITY_THRED: 25
+  STEP: 112
+  MAX_PER_CLASS: 500
+  SAVE_MASK: false # reserved config for segmentation
+CNN:
+  ARCH: 'resnet50'
+  PRETRAINED: false
+  FREEZE_FEAT: false
+  CONTRASTIVE: true
+  CDC_FINETUE: false
+  BYOL:
+    HIDDEN_DIM: 2048
+    PRE_DIM: 256
+    M_DECAY: 0.99
+    FIX_PRED_LR: True
+  CDC:
+    NEG_THRED: 0.5
+    POS_THRED: 0.5
+    TOP_K: 10
+FEATURE:
+  STEP: 224
+  MAX_NODES: 2048
+VIT:
+  DEPTH: 6
+  HEADS: 8
+  DIM: 256
+  MLP_DIM: 512
+  HEAD_DIM: 64
+  POOL: 'cls'
+KAT:
+  KERNEL_NUM : 64
+  PATCH_PER_KERNEL : 144
+  BYOL:
+    PROJECTOR_DIM : 32
+    NODE_AUG : 0.6
+    SL_WEIGHT: 0.1
