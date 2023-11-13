@@ -16,7 +16,7 @@ import torch.utils.data.distributed
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
 import torch.distributed as dist
-
+from itertools import chain
 from model import FGCR, fgcr_inference
 from loader import KernelWSILoader
 from loader import DistributedWeightedSampler
