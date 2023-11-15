@@ -24,8 +24,6 @@ class KernelWSILoader(torch.utils.data.Dataset):
         self.nk = max_kernel_num
         self.feat_dim = wsi_data['feats'].shape[1]
 
-
-        
     def __len__(self):
         return len(self.dl)
 
@@ -64,9 +62,7 @@ class KernelWSILoader(torch.utils.data.Dataset):
         promote = wsi_data['prompt']
         data = self.pack_data(features, rd, num_node, text_index, promote, pos, all_pos, wsi_label)    
 
-        return data, wsi_label, self.get_wsi_data_path(idx).split('/')[-1][:-4]
-
-
+        return data, self.get_wsi_data_path(idx).split('/')[-1][:-4]
 
     def pack_data(self, feat, rd, num_node, text_feat, promote, pos, all_pos, wsi_label, text_length = 150):
         num_anchor = rd.shape[0]
@@ -98,8 +94,6 @@ class KernelWSILoader(torch.utils.data.Dataset):
 
         return wsi_feat, wsi_rd, text, pm, token_mask, kernel_mask, text_mask, pm_mask, pos_out, all_pos_out, wsi_label
 
-
-
     def get_wsi_data_path(self, idx):
         return os.path.join(self.list_dir, self.dl[idx][0])
 
@@ -113,6 +107,7 @@ class KernelWSILoader(torch.utils.data.Dataset):
         weights = 1 / np.asarray(tmp[labels], np.float)
         
         return weights
+
 
 class DistributedWeightedSampler(data.DistributedSampler):
     def __init__(self, dataset, weights, num_replicas=None, rank=None, replacement=True):
@@ -138,5 +133,3 @@ class DistributedWeightedSampler(data.DistributedSampler):
         assert len(indices) == self.num_samples
 
         return iter(indices)
-
-

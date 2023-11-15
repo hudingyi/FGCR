@@ -59,7 +59,6 @@ class BertLMPredictionHead(nn.Module):
         return hidden_states
 
 
-
 class TransformerEncoder(nn.Module):
 
     def __init__(self, encoder_layer, num_layers, norm=None):
@@ -84,6 +83,7 @@ class TransformerEncoder(nn.Module):
             output = self.norm(output)
 
         return output.permute(1, 0, 2)
+
 
 class TransformerEncoderLayer(nn.Module):
 
@@ -121,7 +121,6 @@ class TransformerEncoderLayer(nn.Module):
         src = src + self.dropout2(src2)
         src = self.norm2(src)
         return src
-
 
 
 class PreNorm(nn.Module):
@@ -200,7 +199,6 @@ class KernelAttention(nn.Module):
         return self.to_out(att_out), self.to_out(k_out), self.to_out(c_out), attn_.permute(0,1,3,2)
 
 
-
 class KATBlocks(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
         super().__init__()
@@ -244,8 +242,6 @@ class KATBlocks(nn.Module):
         return k_reps, clst, atten_map
 
 
-
-
 class FGCR(nn.Module):
     def __init__(self, patch_dim, prompt_num, dim, depth, heads, mlp_dim, prompt_list, vocab_size=300, t_head=4, t_n_layer=6, t_d_model=256, t_d_ff=512, 
                  t_dropout=0.5, num_kernel=25, dim_head = 64, dropout = 0.5, emb_dropout = 0.,emd_dim= 128, max_position_embeddings=175):
@@ -284,9 +280,7 @@ class FGCR(nn.Module):
         self.dropout = nn.Dropout(emb_dropout)
         self.activate = nn.Tanh()
 
-
-
-    def forward(self, node_features, krd, text, prompt, mask=None, kmask=None, tmask=None, pmask=None, wsi_label=None):
+    def forward(self, node_features, krd, text, prompt, mask=None, kmask=None, tmask=None, pmask=None):
         # extract image features
         x = self.to_patch_embedding(node_features)
         b = x.shape[0]
@@ -294,7 +288,7 @@ class FGCR(nn.Module):
         kernel_tokens = repeat(self.kernel_token, '() () d -> b k d', b = b, k = self.nk)
         x = self.dropout(x)
         k_reps, clst, _ = self.kt(x, kernel_tokens, krd, cls_tokens, mask, kmask)
-        kat_img_ebd = k_reps[5]
+        anchor_ebd = k_reps[5]
         img_token = clst[:,0]
         img_token = self.activate(img_token)
 
@@ -308,21 +302,15 @@ class FGCR(nn.Module):
         text_cls_tokens = repeat(self.text_cls_token, '() n d -> b n d', b = b)
         t = torch.cat((text_cls_tokens, t), dim=1)
         t = self.LayerNorm(t)
-        t = self.dropout(t)        
+        t_feat = self.dropout(t)        
         tmp = torch.ones((tmask.size()[0],1,tmask.size()[2])).int().cuda(non_blocking=True)    
         t_inmask = torch.cat((tmp, tmask), dim=1)[:,:,0]
         t_inmask = t_inmask<0.5
-        t_out = self.text_encoder(t, src_key_padding_mask=t_inmask)
+        t_out = self.text_encoder(t_feat, src_key_padding_mask=t_inmask)
         text_token = t_out[:,0]
         text_emd = t_out[:,1:]
         text_token = self.activate(text_token)
 
-        t_rnd_mask = torch.rand(tmask.size(), out=None).type_as(node_features)<0.6
-        t_inmask_hide = torch.cat((tmp, t_rnd_mask*tmask), dim=1)[:,:,0]
-        t_inmask_hide = t_inmask_hide<0.5
-        t_hide = self.text_encoder(t,src_key_padding_mask=t_inmask_hide)
-        text_emd_hide = t_hide[:,1:]
-        
         #extract prompt features
         prompt_index = torch.tensor(self.prompt).int().cuda(non_blocking=True).long()
         prompt_index = prompt_index.repeat(b,1,1).permute(0, 2, 1)
@@ -334,32 +322,113 @@ class FGCR(nn.Module):
         p += position_embeddings        
         p = self.LayerNorm(p)
         p = self.dropout(p) 
-        p = self.text_encoder(p)
-       
+        prompt_ebd = self.text_encoder(p)
+
+        return img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd
+
+    def loss(self, img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask):
+        # MLM Loss
+        t_rnd_mask = torch.rand(tmask.size(), out=None).type_as(img_token)<0.6
+        tmp = torch.ones((tmask.size()[0],1,tmask.size()[2])).int().cuda(non_blocking=True)    
+        t_inmask_hide = torch.cat((tmp, t_rnd_mask*tmask), dim=1)[:,:,0]
+        t_inmask_hide = t_inmask_hide<0.5
+        t_hide = self.text_encoder(t_feat,src_key_padding_mask=t_inmask_hide)
+        text_emd_hide = t_hide[:,1:]
         mlm_logits = self.text_head(text_emd_hide)
         mlm_logits = torch.sigmoid(mlm_logits)
+        mlm_loss = F.cross_entropy(mlm_logits.view(-1, mlm_logits.size(-1))[tmask.view(-1)>0], text.view(-1)[tmask.view(-1)>0])*0.1
+
+        #PC Loss
         t_cls = self.mlp_head(text_token)
         cls_out = self.mlp_head(img_token)      
+        pc_loss =  multi_cls_loss(cls_out, prompt, pmask) + multi_cls_loss(t_cls, prompt, pmask)
 
+        #APA Loss
+        apa_loss, soft_pred, = APA_Loss(anchor_ebd, kmask, prompt_ebd, prompt, pmask)
+
+        #CTA Loss
+        t_inmask = torch.cat((tmp, tmask), dim=1)[:,:,0]
+        t_inmask = t_inmask<0.5
         patch_atten_output, _ = self.local_atten_layer(
-            kat_img_ebd.permute(1, 0, 2), text_emd.permute(1, 0, 2), text_emd.permute(1, 0, 2), key_padding_mask=t_inmask[:,1:])
+            anchor_ebd.permute(1, 0, 2), text_emd.permute(1, 0, 2), text_emd.permute(1, 0, 2), key_padding_mask=t_inmask[:,1:])
         text_atten_output, _ = self.local_atten_layer(
-            text_emd.permute(1, 0, 2), kat_img_ebd.permute(1, 0, 2), kat_img_ebd.permute(1, 0, 2), key_padding_mask=kmask[:,:,0]<0.5)
-        
-        return mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token, text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output
+            text_emd.permute(1, 0, 2), anchor_ebd.permute(1, 0, 2), anchor_ebd.permute(1, 0, 2), key_padding_mask=kmask[:,:,0]<0.5)
+        loss_patch = cross_sim_loss(anchor_ebd, patch_atten_output, kmask)
+        loss_text = cross_sim_loss(text_emd, text_atten_output, tmask)
+        cta_loss = loss_text+loss_patch
 
-def fgcr_inference(model, data):
+        #WRA Loss
+        wra_loss = WRA_Loss(img_token, text_token)
+
+        loss = apa_loss+wra_loss+mlm_loss+cta_loss+pc_loss
+        return loss
+
+def multi_cls_loss(im_out, prompt, pmask):
+    target = torch.zeros(im_out.size()).cuda()
+    ce_loss = torch.zeros(im_out.size()[0]).cuda()
+    for i in range(im_out.size()[0]):
+        target[i,prompt[i][pmask[i]>0]]=1 
+        ce_loss[i] = F.binary_cross_entropy(torch.softmax(im_out[i].clone(),dim=0), target[i].clone())
+
+    return ce_loss.mean()
+
+def APA_Loss(img_feat, kmask, p_ebd, prompt, pmask, T=10):
+    img_text_matrix =  einsum('b i j, b j d -> b i d', img_feat, p_ebd.permute(0, 2, 1))/img_feat.size()[2]/T
+    target = torch.zeros(p_ebd.size()[0:2]).cuda()
+    ce_loss = torch.zeros(p_ebd.size()[0]).cuda()
+    soft_pred = torch.zeros(p_ebd.size()[0:2]).cuda()
+    soft_pred_k = torch.zeros(img_text_matrix.size()).cuda()
+    for i in range(img_text_matrix.size()[0]):
+        target[i,prompt[i][pmask[i]>0]]=1 
+        kmask_part = kmask[i].reshape(img_text_matrix.size()[1])>0
+        img_text_matrix_part = img_text_matrix[i][kmask_part]
+        pred_logit_part = torch.sigmoid(img_text_matrix_part)
+        soft_pred_part = torch.softmax(img_text_matrix_part,dim=0) *pred_logit_part
+        soft_pred_k[i][kmask_part] = soft_pred_part
+        soft_pred[i] = soft_pred_part.sum(0)
+        ce_loss[i] = F.binary_cross_entropy(soft_pred[i].clone(), target[i].clone())
+
+    return ce_loss.mean(), soft_pred
+
+def WRA_Loss(img_rep, text_rep):
+    bz = img_rep.size(0)
+    labels = torch.arange(bz).type_as(text_rep).long()
+    scores = img_rep.mm(text_rep.t())/img_rep.size(1)
+    scores1 = scores.transpose(0, 1)
+    loss0 = F.cross_entropy(scores, labels)
+    loss1 = F.cross_entropy(scores1, labels)
+    loss_ita = (loss0 + loss1)*0.2
+
+    return loss_ita
+
+def cross_sim_loss(kat_img_ebd, data_atten_output, mask):
+    data_sim = torch.bmm(kat_img_ebd, data_atten_output.permute(
+        1, 2, 0)) / kat_img_ebd.size(2)
+    data_num = data_sim.size(1)
+    bz = data_sim.size(0)
+    mask = rearrange(mask, "b n1 n2 -> (b n1 n2)")>0
+    data_sim_1 = rearrange(data_sim, "b n1 n2 -> (b n1) n2")
+    targets = torch.arange(data_num).type_as(
+        data_sim).long().repeat(bz)
+    loss_data_1 = torch.sum(F.cross_entropy(
+        data_sim_1[mask], targets[mask], reduction="none") ) / mask.sum()
+
+    data_sim_2 = rearrange(data_sim, "b n1 n2 -> (b n2) n1")
+    loss_data_2 = torch.sum(F.cross_entropy(
+        data_sim_2[mask], targets[mask], reduction="none") ) / mask.sum()
+    loss = (loss_data_1 + loss_data_2) * 0.01
+
+    return loss
+
+def unpack_data(data):
     feats = data[0].float().cuda(non_blocking=True)
     rd = data[1].float().cuda(non_blocking=True)
     text = data[2].int().cuda(non_blocking=True).long()
     prompt = data[3].int().cuda(non_blocking=True).long()
-    masks = data[4].int().cuda(non_blocking=True)
-    kmasks = data[5].int().cuda(non_blocking=True)
+    mask = data[4].int().cuda(non_blocking=True)
+    kmask = data[5].int().cuda(non_blocking=True)
     tmask = data[6].int().cuda(non_blocking=True)
     pmask = data[7].int().cuda(non_blocking=True)
     wsi_label = data[10].int().cuda(non_blocking=True).long()
 
-    return model(feats, rd, text, prompt, masks, kmasks, tmask, pmask, wsi_label)
-
-
-
+    return feats, rd, text, prompt, mask, kmask, tmask, pmask, wsi_label

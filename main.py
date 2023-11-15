@@ -14,11 +14,8 @@ import torch.utils.data.distributed
 import torch.backends.cudnn as cudnn
 import torch.multiprocessing as mp
 import torch.distributed as dist
-import torch.nn.functional as F
-from torch import einsum
-from einops import rearrange
 from itertools import chain
-from model import FGCR, fgcr_inference
+from model import FGCR, unpack_data
 from loader import KernelWSILoader
 from loader import DistributedWeightedSampler
 from utils import *
@@ -325,7 +322,6 @@ def main_worker(gpu, ngpus_per_node, args):
                         'args': args
                     }, os.path.join(graph_model_path, 'model_{}.pth.tar'.format(epoch + 1)))
 
-
 def train(train_loader, model, optimizer, epoch, args):
     batch_time = AverageMeter('Time', ':6.3f')
     data_time = AverageMeter('Data', ':6.3f')
@@ -335,33 +331,27 @@ def train(train_loader, model, optimizer, epoch, args):
 
     # switch to train mode
     model.train()
-    all_prompt = []
-    all_pmask = []
     end = time.time()
-    for i, (data, label, _) in enumerate(train_loader):
+    for i, (data, _) in enumerate(train_loader):
         # measure data loading time
-        begin = time.time()
         data_time.update(time.time() - end)
-        target = label.cuda(non_blocking=True)
+        feats, rd, text, prompt, mask, kmask, tmask, pmask, wsi_label = unpack_data(
+            data)
 
         # compute output
-        mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token, text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output = fgcr_inference(
-            model, data)
-        loss = calc_loss(mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token,
-                                     text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output)
-
-        all_prompt.append(data[3][:, :, 0])
-        all_pmask.append(data[7][:, :, 0])
+        img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd = model(feats, 
+            rd, text, prompt, mask, kmask, tmask, pmask)
+        loss = model.loss(img_token, anchor_ebd, text_token, t_feat,
+                          text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask)
 
         # measure accuracy and record loss
-        losses.update(loss.item(), target.size(0))
+        losses.update(loss.item(), wsi_label.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward(retain_graph=True)
         optimizer.step()
 
-        # print(time.time()-begin)
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
@@ -371,8 +361,6 @@ def train(train_loader, model, optimizer, epoch, args):
 
     return losses.avg
 
-
-
 def evaluate(val_loader, model, args, prefix='Valid'):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
@@ -381,28 +369,22 @@ def evaluate(val_loader, model, args, prefix='Valid'):
 
     # switch to evaluate mode
     model.eval()
-    y_labels = []
-    prompt = []
-    pmask = []
-    end = time.time()
-    
+    end = time.time()    
     processing_time = 0
     with torch.no_grad():
-        for i, (data, label, _) in enumerate(val_loader):
-            target = label.cuda(non_blocking=True)
+        for i, (data, _) in enumerate(val_loader):
+            feats, rd, text, prompt, mask, kmask, tmask, pmask, wsi_label = unpack_data(
+                data)
             # compute output
             pro_start = time.time()
-            mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token, text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output = fgcr_inference(
-                model, data)
-            loss = calc_loss(mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token,
-                                        text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output)
+            img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd = model(feats, 
+                rd, text, prompt, mask, kmask, tmask, pmask)
+            loss = model.loss(img_token, anchor_ebd, text_token, t_feat,
+                            text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask)
             processing_time += (time.time() - pro_start)
 
-            y_labels.append(label)
-            prompt.append(data[3][:,:,0])
-            pmask.append(data[7][:,:,0])
             # measure accuracy and record loss
-            losses.update(loss.item(), target.size(0))
+            losses.update(loss.item(), wsi_label.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -429,15 +411,16 @@ def save_feature(val_loader, model, args, graph_model_path, prefix='Valid'):
     
     processing_time = 0
     with torch.no_grad():
-        for i, (data, label, slide) in enumerate(val_loader):
-            target = label.cuda(non_blocking=True)
+        for i, (data, slide) in enumerate(val_loader):
+            feats, rd, text, prompt, mask, kmask, tmask, pmask, wsi_label = unpack_data(
+                data)
             # compute output
             pro_start = time.time()
-            _, _, _, _, _, _, _, img_token, text_token, _, _, _, _, _, _ = fgcr_inference(
-                model, data)
+            img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd = model(feats, 
+                rd, text, prompt, mask, kmask, tmask, pmask)
             processing_time += (time.time() - pro_start)
 
-            y_labels.append(label)
+            y_labels.append(wsi_label.cpu().data)
             all_prompt.append(data[3][:,:,0])
             all_pmask.append(data[7][:,:,0])
             slide_total.append(slide)
@@ -470,80 +453,6 @@ def save_feature(val_loader, model, args, graph_model_path, prefix='Valid'):
             }
         pickle.dump(graph, f)
 
-
-def multi_cls_loss(im_out, prompt, pmask):
-    target = torch.zeros(im_out.size()).cuda()
-    ce_loss = torch.zeros(im_out.size()[0]).cuda()
-    for i in range(im_out.size()[0]):
-        target[i,prompt[i][pmask[i]>0]]=1 
-        ce_loss[i] = F.binary_cross_entropy(torch.softmax(im_out[i].clone(),dim=0), target[i].clone())
-
-    return ce_loss.mean()
-
-def APA_Loss(img_feat, kmask, p_ebd, prompt, pmask, T=10):
-    img_text_matrix =  einsum('b i j, b j d -> b i d', img_feat, p_ebd.permute(0, 2, 1))/img_feat.size()[2]/T
-    target = torch.zeros(p_ebd.size()[0:2]).cuda()
-    ce_loss = torch.zeros(p_ebd.size()[0]).cuda()
-    soft_pred = torch.zeros(p_ebd.size()[0:2]).cuda()
-    soft_pred_k = torch.zeros(img_text_matrix.size()).cuda()
-    for i in range(img_text_matrix.size()[0]):
-        target[i,prompt[i][pmask[i]>0]]=1 
-        kmask_part = kmask[i].reshape(img_text_matrix.size()[1])>0
-        img_text_matrix_part = img_text_matrix[i][kmask_part]
-        pred_logit_part = torch.sigmoid(img_text_matrix_part)
-        soft_pred_part = torch.softmax(img_text_matrix_part,dim=0) *pred_logit_part
-        soft_pred_k[i][kmask_part] = soft_pred_part
-        soft_pred[i] = soft_pred_part.sum(0)
-        ce_loss[i] = F.binary_cross_entropy(soft_pred[i].clone(), target[i].clone())
-
-    return ce_loss.mean(), soft_pred
-
-def WRA_Loss(img_rep, text_rep):
-    bz = img_rep.size(0)
-    labels = torch.arange(bz).type_as(text_rep).long()
-    scores = img_rep.mm(text_rep.t())/img_rep.size(1)
-    scores1 = scores.transpose(0, 1)
-    loss0 = F.cross_entropy(scores, labels)
-    loss1 = F.cross_entropy(scores1, labels)
-    loss_ita = (loss0 + loss1)*0.2
-
-    return loss_ita
-
-def cross_sim_loss(kat_img_ebd, data_atten_output, mask):
-    data_sim = torch.bmm(kat_img_ebd, data_atten_output.permute(
-        1, 2, 0)) / kat_img_ebd.size(2)
-    data_num = data_sim.size(1)
-    bz = data_sim.size(0)
-    mask = rearrange(mask, "b n1 n2 -> (b n1 n2)")>0
-    data_sim_1 = rearrange(data_sim, "b n1 n2 -> (b n1) n2")
-    targets = torch.arange(data_num).type_as(
-        data_sim).long().repeat(bz)
-    loss_data_1 = torch.sum(F.cross_entropy(
-        data_sim_1[mask], targets[mask], reduction="none") ) / mask.sum()
-
-    data_sim_2 = rearrange(data_sim, "b n1 n2 -> (b n2) n1")
-    loss_data_2 = torch.sum(F.cross_entropy(
-        data_sim_2[mask], targets[mask], reduction="none") ) / mask.sum()
-    loss = (loss_data_1 + loss_data_2) * 0.01
-
-    return loss
-
-def calc_loss(mlm_logits, tmask, text, cls_out, prompt, pmask, t_cls, img_token, 
-            text_token, kat_img_ebd, kmask, p, patch_atten_output, text_emd, text_atten_output):
-    mlm_loss = F.cross_entropy(mlm_logits.view(-1, mlm_logits.size(-1))[tmask.view(-1)>0], text.view(-1)[tmask.view(-1)>0])*0.1
-    pc_loss =  multi_cls_loss(cls_out, prompt, pmask) + multi_cls_loss(t_cls, prompt, pmask)
-    WRA_loss = WRA_Loss(img_token, text_token)
-    APA_loss, soft_pred, = APA_Loss(kat_img_ebd, kmask, p, prompt, pmask)
-    loss_patch = cross_sim_loss(kat_img_ebd, patch_atten_output, kmask)
-    loss_text = cross_sim_loss(text_emd, text_atten_output, tmask)
-    loss_cross_sim = loss_text+loss_patch
-    loss = APA_loss+WRA_loss+mlm_loss+loss_cross_sim+pc_loss
-    
-    return loss
-
-
 if __name__ == "__main__":
     args = arg_parse()
     main(args)
-
-
