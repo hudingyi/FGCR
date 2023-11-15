@@ -401,9 +401,9 @@ def WRA_Loss(img_rep, text_rep):
 
     return loss_ita
 
-def cross_sim_loss(kat_img_ebd, data_atten_output, mask):
-    data_sim = torch.bmm(kat_img_ebd, data_atten_output.permute(
-        1, 2, 0)) / kat_img_ebd.size(2)
+def cross_sim_loss(anchor_ebd, data_atten_output, mask):
+    data_sim = torch.bmm(anchor_ebd, data_atten_output.permute(
+        1, 2, 0)) / anchor_ebd.size(2)
     data_num = data_sim.size(1)
     bz = data_sim.size(0)
     mask = rearrange(mask, "b n1 n2 -> (b n1 n2)")>0
