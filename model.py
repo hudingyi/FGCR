@@ -247,7 +247,7 @@ class FGCR(nn.Module):
                  t_dropout=0.5, num_kernel=25, dim_head = 64, dropout = 0.5, emb_dropout = 0.,emd_dim= 128, max_position_embeddings=175):
         super().__init__()
 
-        #Image_encoder
+        # Image_encoder
         self.to_patch_embedding = nn.Linear(patch_dim, dim)
         self.img_cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.kernel_token = nn.Parameter(torch.randn(1, 1, dim))
@@ -255,7 +255,7 @@ class FGCR(nn.Module):
         self.kt = KATBlocks(dim, depth, heads, dim_head, mlp_dim, dropout)
 
 
-        #Text Encoder
+        # Text Encoder
         self.prompt = prompt_list
         self.register_buffer("position_ids", torch.arange(max_position_embeddings).expand((1, -1)))
         self.text_position_embeddings = nn.Embedding(max_position_embeddings, dim)
@@ -269,7 +269,7 @@ class FGCR(nn.Module):
         self.text_cls_token = nn.Parameter(torch.randn(1, 1, dim))
         self.text_head = BertLMPredictionHead(dim, vocab_size)
 
-        #Local sructure
+        # Local sructure
         self.local_atten_layer = nn.MultiheadAttention(
             dim, heads)
         self.mlp_head = nn.Sequential(
@@ -311,7 +311,7 @@ class FGCR(nn.Module):
         text_emd = t_out[:,1:]
         text_token = self.activate(text_token)
 
-        #extract prompt features
+        # extract prompt features
         prompt_index = torch.tensor(self.prompt).int().cuda(non_blocking=True).long()
         prompt_index = prompt_index.repeat(b,1,1).permute(0, 2, 1)
         p = self.text_embedding(prompt_index)
@@ -327,7 +327,7 @@ class FGCR(nn.Module):
         return img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd
 
     def loss(self, img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask):
-        # MLM Loss
+        # Masked Language Modeling (MLM) 
         t_rnd_mask = torch.rand(tmask.size(), out=None).type_as(img_token)<0.6
         tmp = torch.ones((tmask.size()[0],1,tmask.size()[2])).int().cuda(non_blocking=True)    
         t_inmask_hide = torch.cat((tmp, t_rnd_mask*tmask), dim=1)[:,:,0]
@@ -338,15 +338,15 @@ class FGCR(nn.Module):
         mlm_logits = torch.sigmoid(mlm_logits)
         mlm_loss = F.cross_entropy(mlm_logits.view(-1, mlm_logits.size(-1))[tmask.view(-1)>0], text.view(-1)[tmask.view(-1)>0])*0.1
 
-        #PC Loss
-        t_cls = self.mlp_head(text_token)
-        cls_out = self.mlp_head(img_token)      
-        pc_loss =  multi_cls_loss(cls_out, prompt, pmask) + multi_cls_loss(t_cls, prompt, pmask)
+        # Prompt Classification (PC)
+        text_cls = self.mlp_head(text_token)
+        img_cls = self.mlp_head(img_token)      
+        pc_loss =  multi_cls_loss(img_cls, prompt, pmask) + multi_cls_loss(text_cls, prompt, pmask)
 
-        #APA Loss
+        # Anchor-Prompt Alignment (APA)
         apa_loss, soft_pred, = APA_Loss(anchor_ebd, kmask, prompt_ebd, prompt, pmask)
 
-        #CTA Loss
+        # Coss-attention Token Alignment (CTA)
         t_inmask = torch.cat((tmp, tmask), dim=1)[:,:,0]
         t_inmask = t_inmask<0.5
         patch_atten_output, _ = self.local_atten_layer(
@@ -357,7 +357,7 @@ class FGCR(nn.Module):
         loss_text = cross_sim_loss(text_emd, text_atten_output, tmask)
         cta_loss = loss_text+loss_patch
 
-        #WRA Loss
+        # WSI-Report Alignment (WRA) 
         wra_loss = WRA_Loss(img_token, text_token)
 
         loss = apa_loss+wra_loss+mlm_loss+cta_loss+pc_loss
