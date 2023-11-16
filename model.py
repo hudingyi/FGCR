@@ -86,7 +86,6 @@ class TransformerEncoder(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-
     def __init__(self, d_model, nhead, dim_feedforward=512, dropout=0.1,
                  activation="relu", normalize_before=False):
         super().__init__()
@@ -171,7 +170,6 @@ class KernelAttention(nn.Module):
         k_q, k_k, k_v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), k_kqv)
         c_q, _  , _   = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), c_kqv)
 
-        # information summary flow (ISF) -- Eq.2
         dots = einsum('b h i d, b h j d -> b h i j', t_q, k_k) * self.scale
         if att_mask is not None:
             dots = dots.masked_fill(att_mask, torch.tensor(-1e9))
@@ -180,7 +178,6 @@ class KernelAttention(nn.Module):
         att_out = einsum('b h i j, b h j d -> b h i d', attn, k_v)
         att_out = rearrange(att_out, 'b h n d -> b n (h d)')
 
-        # information distribution flow (IDF) -- Eq.3
         k_dots = einsum('b h i d, b h j d -> b h i j', k_q, t_k) * self.scale
         if att_mask is not None:
             k_dots = k_dots.masked_fill(att_mask.permute(0,1,3,2), torch.tensor(-1e9))
@@ -188,7 +185,6 @@ class KernelAttention(nn.Module):
         k_out = einsum('b h i j, b h j d -> b h i d', k_attn, t_v)
         k_out = rearrange(k_out, 'b h n d -> b n (h d)')
 
-        # classification token -- Eq.4
         c_dots = einsum('b h i d, b h j d -> b h i j', c_q, k_k) * self.scale
         if att_mask is not None:
             c_dots = c_dots.masked_fill(att_mask[:,:,:1], torch.tensor(-1e9))
@@ -219,7 +215,6 @@ class KATBlocks(nn.Module):
         att_mask = repeat(att_mask.unsqueeze(1), 'b () i j -> b h i j', h = self.h) < 0.5
 
         rd = repeat(rd.unsqueeze(1), 'b () i j -> b h i j', h = self.h)
-        # rd2 = rd * rd
         soft_mask = rd
 
         k_reps = []
@@ -254,7 +249,6 @@ class FGCR(nn.Module):
         self.nk = num_kernel
         self.kt = KATBlocks(dim, depth, heads, dim_head, mlp_dim, dropout)
 
-
         # Text Encoder
         self.prompt = prompt_list
         self.register_buffer("position_ids", torch.arange(max_position_embeddings).expand((1, -1)))
@@ -280,8 +274,8 @@ class FGCR(nn.Module):
         self.dropout = nn.Dropout(emb_dropout)
         self.activate = nn.Tanh()
 
-    def forward(self, node_features, krd, text, prompt, mask=None, kmask=None, tmask=None, pmask=None):
-        # extract image features
+    def forward(self, node_features, krd, text, mask=None, kmask=None, tmask=None, pmask=None):
+        # Extract image features
         x = self.to_patch_embedding(node_features)
         b = x.shape[0]
         cls_tokens = repeat(self.img_cls_token, '() n d -> b n d', b = b)
@@ -289,10 +283,10 @@ class FGCR(nn.Module):
         x = self.dropout(x)
         k_reps, clst, _ = self.kt(x, kernel_tokens, krd, cls_tokens, mask, kmask)
         anchor_ebd = k_reps[5]
-        img_token = clst[:,0]
-        img_token = self.activate(img_token)
+        img_cls = clst[:,0]
+        img_cls = self.activate(img_cls)
 
-        # extract text features
+        # Extract text features
         t = self.text_embedding(text)
         t = self.text_linear(t)
         position_ids = self.position_ids[:, 0 : t.size()[1]]
@@ -307,11 +301,11 @@ class FGCR(nn.Module):
         t_inmask = torch.cat((tmp, tmask), dim=1)[:,:,0]
         t_inmask = t_inmask<0.5
         t_out = self.text_encoder(t_feat, src_key_padding_mask=t_inmask)
-        text_token = t_out[:,0]
-        text_emd = t_out[:,1:]
-        text_token = self.activate(text_token)
+        text_cls = t_out[:,0]
+        text_ebd = t_out[:,1:]
+        text_cls = self.activate(text_cls)
 
-        # extract prompt features
+        # Extract prompt features
         prompt_index = torch.tensor(self.prompt).int().cuda(non_blocking=True).long()
         prompt_index = prompt_index.repeat(b,1,1).permute(0, 2, 1)
         p = self.text_embedding(prompt_index)
@@ -324,41 +318,41 @@ class FGCR(nn.Module):
         p = self.dropout(p) 
         prompt_ebd = self.text_encoder(p)
 
-        return img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd
+        return img_cls, anchor_ebd, text_cls, t_feat, text_ebd, prompt_ebd
 
-    def loss(self, img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask):
+    def loss(self, img_cls, anchor_ebd, text_cls, t_feat, text_ebd, prompt_ebd, prompt, text, tmask,  kmask, pmask):
         # Masked Language Modeling (MLM) 
-        t_rnd_mask = torch.rand(tmask.size(), out=None).type_as(img_token)<0.6
+        t_rnd_mask = torch.rand(tmask.size(), out=None).type_as(img_cls)<0.6
         tmp = torch.ones((tmask.size()[0],1,tmask.size()[2])).int().cuda(non_blocking=True)    
         t_inmask_hide = torch.cat((tmp, t_rnd_mask*tmask), dim=1)[:,:,0]
         t_inmask_hide = t_inmask_hide<0.5
         t_hide = self.text_encoder(t_feat,src_key_padding_mask=t_inmask_hide)
-        text_emd_hide = t_hide[:,1:]
-        mlm_logits = self.text_head(text_emd_hide)
+        text_ebd_hide = t_hide[:,1:]
+        mlm_logits = self.text_head(text_ebd_hide)
         mlm_logits = torch.sigmoid(mlm_logits)
         mlm_loss = F.cross_entropy(mlm_logits.view(-1, mlm_logits.size(-1))[tmask.view(-1)>0], text.view(-1)[tmask.view(-1)>0])*0.1
 
-        # Prompt Classification (PC)
-        text_cls = self.mlp_head(text_token)
-        img_cls = self.mlp_head(img_token)      
+        # Prompt Classification (PC) -- Eq.11
+        text_cls = self.mlp_head(text_cls)
+        img_cls = self.mlp_head(img_cls)      
         pc_loss =  multi_cls_loss(img_cls, prompt, pmask) + multi_cls_loss(text_cls, prompt, pmask)
 
-        # Anchor-Prompt Alignment (APA)
+        # Anchor-Prompt Alignment (APA) -- Eq.7
         apa_loss, soft_pred, = APA_Loss(anchor_ebd, kmask, prompt_ebd, prompt, pmask)
 
-        # Coss-attention Token Alignment (CTA)
+        # Coss-attention Token Alignment (CTA) -- Eq.10
         t_inmask = torch.cat((tmp, tmask), dim=1)[:,:,0]
         t_inmask = t_inmask<0.5
         patch_atten_output, _ = self.local_atten_layer(
-            anchor_ebd.permute(1, 0, 2), text_emd.permute(1, 0, 2), text_emd.permute(1, 0, 2), key_padding_mask=t_inmask[:,1:])
+            anchor_ebd.permute(1, 0, 2), text_ebd.permute(1, 0, 2), text_ebd.permute(1, 0, 2), key_padding_mask=t_inmask[:,1:])
         text_atten_output, _ = self.local_atten_layer(
-            text_emd.permute(1, 0, 2), anchor_ebd.permute(1, 0, 2), anchor_ebd.permute(1, 0, 2), key_padding_mask=kmask[:,:,0]<0.5)
+            text_ebd.permute(1, 0, 2), anchor_ebd.permute(1, 0, 2), anchor_ebd.permute(1, 0, 2), key_padding_mask=kmask[:,:,0]<0.5)
         loss_patch = cross_sim_loss(anchor_ebd, patch_atten_output, kmask)
-        loss_text = cross_sim_loss(text_emd, text_atten_output, tmask)
+        loss_text = cross_sim_loss(text_ebd, text_atten_output, tmask)
         cta_loss = loss_text+loss_patch
 
-        # WSI-Report Alignment (WRA) 
-        wra_loss = WRA_Loss(img_token, text_token)
+        # WSI-Report Alignment (WRA) -- Eq.6
+        wra_loss = WRA_Loss(img_cls, text_cls)
 
         loss = apa_loss+wra_loss+mlm_loss+cta_loss+pc_loss
         return loss
