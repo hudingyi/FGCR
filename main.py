@@ -339,10 +339,10 @@ def train(train_loader, model, optimizer, epoch, args):
             data)
 
         # compute output
-        img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd = model(feats, 
-            rd, text, prompt, mask, kmask, tmask, pmask)
-        loss = model.loss(img_token, anchor_ebd, text_token, t_feat,
-                          text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask)
+        img_cls, anchor_ebd, text_cls, t_feat, text_ebd, prompt_ebd = model(feats, 
+            rd, text, mask, kmask, tmask, pmask)
+        loss = model.loss(img_cls, anchor_ebd, text_cls, t_feat,
+                          text_ebd, prompt_ebd, prompt, text, tmask,  kmask, pmask)
 
         # measure accuracy and record loss
         losses.update(loss.item(), wsi_label.size(0))
@@ -377,10 +377,10 @@ def evaluate(val_loader, model, args, prefix='Valid'):
                 data)
             # compute output
             pro_start = time.time()
-            img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd = model(feats, 
-                rd, text, prompt, mask, kmask, tmask, pmask)
-            loss = model.loss(img_token, anchor_ebd, text_token, t_feat,
-                            text_emd, prompt_ebd, prompt, text, tmask,  kmask, pmask)
+            img_cls, anchor_ebd, text_cls, t_feat, text_ebd, prompt_ebd = model(feats, 
+                rd, text, mask, kmask, tmask, pmask)
+            loss = model.loss(img_cls, anchor_ebd, text_cls, t_feat,
+                            text_ebd, prompt_ebd, prompt, text, tmask,  kmask, pmask)
             processing_time += (time.time() - pro_start)
 
             # measure accuracy and record loss
@@ -416,16 +416,16 @@ def save_feature(val_loader, model, args, graph_model_path, prefix='Valid'):
                 data)
             # compute output
             pro_start = time.time()
-            img_token, anchor_ebd, text_token, t_feat, text_emd, prompt_ebd = model(feats, 
-                rd, text, prompt, mask, kmask, tmask, pmask)
+            img_cls, anchor_ebd, text_cls, t_feat, text_ebd, prompt_ebd = model(feats, 
+                rd, text, mask, kmask, tmask, pmask)
             processing_time += (time.time() - pro_start)
 
             y_labels.append(wsi_label.cpu().data)
             all_prompt.append(data[3][:,:,0])
             all_pmask.append(data[7][:,:,0])
             slide_total.append(slide)
-            img_feature.append(img_token.cpu().data)
-            text_feature.append(text_token.cpu().data)
+            img_feature.append(img_cls.cpu().data)
+            text_feature.append(text_cls.cpu().data)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
