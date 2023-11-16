@@ -60,13 +60,11 @@ class BertLMPredictionHead(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-
     def __init__(self, encoder_layer, num_layers, norm=None):
         super().__init__()
         self.layers = _get_clones(encoder_layer, num_layers)
         self.num_layers = num_layers
         self.norm = norm
-
 
     def forward(self, src,
                 mask: Optional[Tensor] = None,
